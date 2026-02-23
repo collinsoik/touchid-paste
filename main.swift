@@ -6,7 +6,28 @@ import AppKit
 // MARK: - Constants
 
 let keychainService = "com.touchid-paste.ssh-password"
-let keychainAccount = "proxmox-vms"
+let defaultAccount = "default"
+
+// MARK: - Error Handling
+
+func keychainErrorMessage(_ status: OSStatus) -> String {
+    switch status {
+    case errSecItemNotFound:
+        return "item not found"
+    case errSecAuthFailed:
+        return "authentication failed"
+    case errSecUserCanceled:
+        return "user canceled"
+    case errSecDuplicateItem:
+        return "duplicate item"
+    case errSecInteractionNotAllowed:
+        return "interaction not allowed"
+    case errSecDecode:
+        return "unable to decode data"
+    default:
+        return "error (status \(status))"
+    }
+}
 
 // MARK: - Keychain Operations
 
@@ -18,19 +39,24 @@ func createBiometricAccessControl() -> SecAccessControl? {
         .biometryCurrentSet,
         &error
     )
-    if let error = error {
-        fputs("Error creating access control: \(error.takeRetainedValue())\n", stderr)
+    if error != nil {
+        fputs("Error creating biometric access control.\n", stderr)
         return nil
     }
     return access
 }
 
-func storePassword(_ password: String) -> Bool {
+func storePassword(_ password: String, account: String) -> Bool {
+    guard let passwordData = password.data(using: .utf8) else {
+        fputs("Error: password contains invalid characters.\n", stderr)
+        return false
+    }
+
     // Delete existing item first (ignore error if not found)
     let deleteQuery: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
+        kSecAttrAccount as String: account,
     ]
     SecItemDelete(deleteQuery as CFDictionary)
 
@@ -44,29 +70,29 @@ func storePassword(_ password: String) -> Bool {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
+        kSecAttrAccount as String: account,
         kSecAttrLabel as String: "SSH/sudo password (touchid-paste)",
-        kSecValueData as String: password.data(using: .utf8)!,
+        kSecValueData as String: passwordData,
         kSecAttrAccessControl as String: accessControl,
         kSecUseAuthenticationContext as String: context,
     ]
 
     let status = SecItemAdd(query as CFDictionary, nil)
     if status != errSecSuccess {
-        fputs("Keychain store failed: \(SecCopyErrorMessageString(status, nil) ?? "unknown" as CFString)\n", stderr)
+        fputs("Keychain store failed: \(keychainErrorMessage(status))\n", stderr)
         return false
     }
     return true
 }
 
-func retrievePassword() -> String? {
+func retrievePassword(account: String) -> String? {
     let context = LAContext()
     context.localizedReason = "Access SSH password"
 
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
+        kSecAttrAccount as String: account,
         kSecReturnData as String: true,
         kSecUseAuthenticationContext as String: context,
     ]
@@ -84,31 +110,31 @@ func retrievePassword() -> String? {
         } else if status == errSecAuthFailed {
             fputs("Touch ID authentication failed.\n", stderr)
         } else {
-            fputs("Keychain read failed: \(SecCopyErrorMessageString(status, nil) ?? "unknown" as CFString)\n", stderr)
+            fputs("Keychain read failed: \(keychainErrorMessage(status))\n", stderr)
         }
         return nil
     }
     return password
 }
 
-func deletePassword() -> Bool {
+func deletePassword(account: String) -> Bool {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
+        kSecAttrAccount as String: account,
     ]
     let status = SecItemDelete(query as CFDictionary)
     return status == errSecSuccess || status == errSecItemNotFound
 }
 
-func checkPasswordExists() -> Bool {
+func checkPasswordExists(account: String) -> Bool {
     let context = LAContext()
     context.interactionNotAllowed = true
 
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
+        kSecAttrAccount as String: account,
         kSecUseAuthenticationContext as String: context,
     ]
     var result: AnyObject?
@@ -123,6 +149,13 @@ func pastePassword(_ password: String) {
 
     // Save current clipboard content
     let oldContents = pasteboard.string(forType: .string)
+
+    func clearAndRestore() {
+        pasteboard.clearContents()
+        if let oldContents = oldContents {
+            pasteboard.setString(oldContents, forType: .string)
+        }
+    }
 
     // Put password on clipboard
     pasteboard.clearContents()
@@ -144,17 +177,16 @@ func pastePassword(_ password: String) {
     var errorInfo: NSDictionary?
     appleScript?.executeAndReturnError(&errorInfo)
 
-    if let errorInfo = errorInfo {
-        fputs("AppleScript error: \(errorInfo)\n", stderr)
+    if errorInfo != nil {
+        clearAndRestore()
+        fputs("Failed to paste password. Check Accessibility permissions.\n", stderr)
+        exit(1)
     }
 
     // Clear the password from clipboard after a short delay, restore old contents
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        pasteboard.clearContents()
-        if let oldContents = oldContents {
-            pasteboard.setString(oldContents, forType: .string)
-        }
-        exit(0)
+        clearAndRestore()
+        CFRunLoopStop(CFRunLoopGetMain())
     }
 }
 
@@ -179,10 +211,27 @@ func readSecureInput(prompt: String) -> String? {
 
 // MARK: - Main
 
-let args = CommandLine.arguments
+var args = Array(CommandLine.arguments.dropFirst()) // drop program name
+var account = defaultAccount
 
-if args.count > 1 && args[1] == "setup" {
+// Parse --account flag before subcommand
+if let idx = args.firstIndex(of: "--account") {
+    if idx + 1 < args.count {
+        account = args[idx + 1]
+        args.removeSubrange(idx...idx+1)
+    } else {
+        fputs("Error: --account requires a value.\n", stderr)
+        exit(1)
+    }
+}
+
+let command = args.first
+
+if command == "setup" {
     fputs("touchid-paste: Store SSH/sudo password in Keychain (Touch ID protected)\n", stderr)
+    if account != defaultAccount {
+        fputs("Account: \(account)\n", stderr)
+    }
 
     guard let password = readSecureInput(prompt: "Enter password: ") else {
         fputs("Error reading password.\n", stderr)
@@ -191,6 +240,15 @@ if args.count > 1 && args[1] == "setup" {
     guard !password.isEmpty else {
         fputs("Password cannot be empty.\n", stderr)
         exit(1)
+    }
+    if password.count < 8 {
+        fputs("Warning: password is shorter than 8 characters.\n", stderr)
+        fputs("Continue? (y/N): ", stderr)
+        guard let response = readLine(strippingNewline: true),
+              response.lowercased() == "y" else {
+            fputs("Aborted.\n", stderr)
+            exit(1)
+        }
     }
     guard let confirm = readSecureInput(prompt: "Confirm password: ") else {
         fputs("Error reading confirmation.\n", stderr)
@@ -201,7 +259,7 @@ if args.count > 1 && args[1] == "setup" {
         exit(1)
     }
 
-    if storePassword(password) {
+    if storePassword(password, account: account) {
         fputs("Password stored successfully with Touch ID protection.\n", stderr)
         exit(0)
     } else {
@@ -209,8 +267,18 @@ if args.count > 1 && args[1] == "setup" {
         exit(1)
     }
 
-} else if args.count > 1 && args[1] == "delete" {
-    if deletePassword() {
+} else if command == "delete" {
+    guard checkPasswordExists(account: account) else {
+        fputs("No password stored for account '\(account)'.\n", stderr)
+        exit(1)
+    }
+    fputs("Delete stored password for account '\(account)'? (y/N): ", stderr)
+    guard let response = readLine(strippingNewline: true),
+          response.lowercased() == "y" else {
+        fputs("Aborted.\n", stderr)
+        exit(0)
+    }
+    if deletePassword(account: account) {
         fputs("Password deleted from Keychain.\n", stderr)
         exit(0)
     } else {
@@ -218,8 +286,8 @@ if args.count > 1 && args[1] == "setup" {
         exit(1)
     }
 
-} else if args.count > 1 && args[1] == "check" {
-    if checkPasswordExists() {
+} else if command == "check" {
+    if checkPasswordExists(account: account) {
         fputs("Password is stored.\n", stderr)
         exit(0)
     } else {
@@ -227,9 +295,12 @@ if args.count > 1 && args[1] == "setup" {
         exit(1)
     }
 
-} else if args.count > 1 && (args[1] == "-h" || args[1] == "--help") {
+} else if command == "-h" || command == "--help" {
     fputs("""
-    Usage: touchid-paste [command]
+    Usage: touchid-paste [--account <name>] [command]
+
+    Options:
+      --account <name>  Use a named account (default: "default")
 
     Commands:
       (none)    Authenticate with Touch ID, paste password, press Enter
@@ -241,9 +312,14 @@ if args.count > 1 && args[1] == "setup" {
     """, stderr)
     exit(0)
 
+} else if command != nil {
+    fputs("Unknown command: \(command!)\n", stderr)
+    fputs("Run 'touchid-paste -h' for usage.\n", stderr)
+    exit(1)
+
 } else {
     // Default: authenticate + paste
-    guard let password = retrievePassword() else {
+    guard let password = retrievePassword(account: account) else {
         exit(1)
     }
 

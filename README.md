@@ -83,15 +83,18 @@ Then in Raycast: **Extensions > Script Commands > Add Script Directory**, point 
 
 The first time you trigger the shortcut, macOS will ask you to grant **Accessibility** access to Automator (or Raycast). Go to **System Settings > Privacy & Security > Accessibility** and enable it. This is required for the tool to simulate the Cmd+V keystroke.
 
+> **Security note:** Accessibility access is a powerful permission — any app with it can simulate keystrokes and observe UI elements. Periodically review which apps have Accessibility access in **System Settings > Privacy & Security > Accessibility** and remove any you no longer use.
+
 ## Usage
 
 | Command | Description |
 |---------|-------------|
 | `touchid-paste` | Authenticate with Touch ID, paste password + press Enter |
 | `touchid-paste setup` | Store a new password (replaces any existing one) |
-| `touchid-paste delete` | Remove the stored password from Keychain |
+| `touchid-paste delete` | Remove the stored password from Keychain (prompts for confirmation) |
 | `touchid-paste check` | Check if a password is currently stored (exit code 0 = yes) |
 | `touchid-paste -h` | Show help |
+| `--account <name>` | Use a named account instead of the default (can combine with any command) |
 
 ### Typical workflow
 
@@ -102,6 +105,22 @@ The first time you trigger the shortcut, macOS will ask you to grant **Accessibi
 5. You're logged in
 
 This also works for `sudo` prompts and any other password field in your terminal.
+
+### Multiple accounts
+
+Use `--account` to store separate passwords for different services:
+
+```bash
+# Store passwords for different accounts
+touchid-paste --account work setup
+touchid-paste --account homelab setup
+
+# Paste a specific account's password
+touchid-paste --account work
+touchid-paste --account homelab
+```
+
+Without `--account`, the tool uses a default account. Each account is stored as a separate Keychain item.
 
 ## How your password is protected
 
@@ -146,7 +165,9 @@ The password is on the clipboard for approximately half a second.
 | Password at rest on disk | Yes | Stored only in Keychain (Secure Enclave encrypted) |
 | Other processes reading the password | Yes | Biometric ACL blocks all non-Touch ID access |
 | Password left in clipboard | Yes | Cleared after 0.5s, previous contents restored |
+| Password left on clipboard after paste failure | Yes | Immediately cleared if AppleScript fails |
 | Password in process args or env vars | Yes | Never exposed in either |
+| Keychain metadata leaking account info | Yes | Generic default account name; user-chosen with `--account` |
 | Device theft | Yes | Biometric + device-only flags prevent extraction |
 | Fingerprint enrollment tampering | Yes | `.biometryCurrentSet` invalidates on enrollment change |
 | Clipboard monitoring during 0.5s window | No | Same limitation as 1Password — inherent to clipboard-based paste |
@@ -172,6 +193,14 @@ After creating the Automator Quick Action, you may need to log out and back in (
 
 **"Passwords do not match" during setup:**
 The confirmation password must match exactly. Re-run `touchid-paste setup`.
+
+## Upgrading
+
+If you are upgrading from a version that used a hardcoded account name, your existing Keychain entry may use the old account identifier. Re-run `touchid-paste setup` to store your password under the new default account, or use `--account` to migrate to a named account.
+
+## Security
+
+To report a security vulnerability, please open a GitHub issue or email the repository owner directly. Do not include sensitive details (passwords, Keychain data) in public reports.
 
 ## Uninstalling
 
