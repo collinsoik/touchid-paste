@@ -1,0 +1,13 @@
+# Compiled binary
+touchid-paste
+!main.swift
+
+# macOS
+.DS_Store
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+build/
+DerivedData/
