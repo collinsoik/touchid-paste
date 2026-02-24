@@ -29,22 +29,30 @@ func keychainErrorMessage(_ status: OSStatus) -> String {
     }
 }
 
-// MARK: - Keychain Operations
+// MARK: - Touch ID Authentication
 
-func createBiometricAccessControl() -> SecAccessControl? {
-    var error: Unmanaged<CFError>?
-    let access = SecAccessControlCreateWithFlags(
-        kCFAllocatorDefault,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        .biometryCurrentSet,
-        &error
-    )
-    if error != nil {
-        fputs("Error creating biometric access control.\n", stderr)
-        return nil
+func authenticateWithTouchID(reason: String) -> Bool {
+    let context = LAContext()
+    var error: NSError?
+
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+        fputs("Touch ID not available: \(error?.localizedDescription ?? "unknown error")\n", stderr)
+        return false
     }
-    return access
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var success = false
+
+    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { result, _ in
+        success = result
+        semaphore.signal()
+    }
+
+    semaphore.wait()
+    return success
 }
+
+// MARK: - Keychain Operations
 
 func storePassword(_ password: String, account: String) -> Bool {
     guard let passwordData = password.data(using: .utf8) else {
@@ -60,21 +68,13 @@ func storePassword(_ password: String, account: String) -> Bool {
     ]
     SecItemDelete(deleteQuery as CFDictionary)
 
-    guard let accessControl = createBiometricAccessControl() else {
-        return false
-    }
-
-    let context = LAContext()
-    context.localizedReason = "Store password in Keychain"
-
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
         kSecAttrAccount as String: account,
         kSecAttrLabel as String: "SSH/sudo password (touchid-paste)",
+        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         kSecValueData as String: passwordData,
-        kSecAttrAccessControl as String: accessControl,
-        kSecUseAuthenticationContext as String: context,
     ]
 
     let status = SecItemAdd(query as CFDictionary, nil)
@@ -86,15 +86,17 @@ func storePassword(_ password: String, account: String) -> Bool {
 }
 
 func retrievePassword(account: String) -> String? {
-    let context = LAContext()
-    context.localizedReason = "Access SSH password"
+    // Authenticate with Touch ID first
+    guard authenticateWithTouchID(reason: "Access SSH password") else {
+        fputs("Touch ID authentication failed.\n", stderr)
+        return nil
+    }
 
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
         kSecAttrAccount as String: account,
         kSecReturnData as String: true,
-        kSecUseAuthenticationContext as String: context,
     ]
 
     var result: AnyObject?
@@ -105,10 +107,6 @@ func retrievePassword(account: String) -> String? {
           let password = String(data: data, encoding: .utf8) else {
         if status == errSecItemNotFound {
             fputs("No password stored. Run 'touchid-paste setup' first.\n", stderr)
-        } else if status == errSecUserCanceled {
-            fputs("Touch ID authentication was canceled.\n", stderr)
-        } else if status == errSecAuthFailed {
-            fputs("Touch ID authentication failed.\n", stderr)
         } else {
             fputs("Keychain read failed: \(keychainErrorMessage(status))\n", stderr)
         }
@@ -128,18 +126,14 @@ func deletePassword(account: String) -> Bool {
 }
 
 func checkPasswordExists(account: String) -> Bool {
-    let context = LAContext()
-    context.interactionNotAllowed = true
-
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: keychainService,
         kSecAttrAccount as String: account,
-        kSecUseAuthenticationContext as String: context,
     ]
     var result: AnyObject?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
-    return status == errSecSuccess || status == errSecInteractionNotAllowed
+    return status == errSecSuccess
 }
 
 // MARK: - Paste Action
